@@ -1,0 +1,118 @@
+# Codemagic 云构建配置 —— 完全不用 Mac 也能把 App 传到 TestFlight
+#
+# 用之前必须改 2 处：
+#   - environment.ios_signing.bundle_identifier
+#   - environment.vars.BUNDLE_ID
+# （两处要和 project.yml 里的 PRODUCT_BUNDLE_IDENTIFIER、以及 App Store Connect 里的记录完全一致）
+#
+# 另外还要做 3 件事（详见 docs/codemagic.md）：
+#   1. App Store Connect → My Apps → + → New App，先建好 App 记录
+#   2. App Store Connect → 用户和访问 → 集成 → 生成 API Key（角色 App Manager），下载 .p8
+#   3. Codemagic → Teams → Integrations → App Store Connect 填 Issuer ID / Key ID / .p8
+#
+# 之后在 Codemagic 点 "Start new build" 选 ios-testflight，约 10 分钟，
+# build 会自动出现在 App Store Connect → TestFlight。
+
+workflows:
+  ios-testflight:
+    name: FilmSim → TestFlight
+    max_build_duration: 60
+
+    environment:
+      # Codemagic 会用你的 App Store Connect API Key 自动创建/下载分发证书和描述文件
+      ios_signing:
+        distribution_type: app_store
+        bundle_identifier: com.yourcompany.filmsim
+
+      vars:
+        XCODE_PROJECT: "FilmSim.xcodeproj"
+        XCODE_SCHEME: "FilmSim"
+        BUNDLE_ID: "com.yourcompany.filmsim"
+
+      xcode: latest
+      # 构建报 Xcode 版本问题时改成固定版本，例如 xcode: 16.1
+
+    scripts:
+      - name: 安装 XcodeGen 并生成工程
+        script: |
+          set -e
+          brew install xcodegen
+          xcodegen generate
+
+      - name: 设置 build 号
+        # 每次云端构建用 Codemagic 的递增序号，避免 "build 号必须更大" 被拒
+        script: |
+          set -e
+          agvtool new-version -all "${BUILD_NUMBER:-1}"
+
+      - name: 应用签名描述文件
+        script: |
+          set -e
+          xcode-project use-profiles
+
+      - name: 打包 ipa
+        script: |
+          set -e
+          xcode-project build-ipa \
+            --project "$XCODE_PROJECT" \
+            --scheme "$XCODE_SCHEME"
+
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
+
+    publishing:
+      app_store_connect:
+        # 这三个变量由 Codemagic 的 App Store Connect 集成自动注入
+        api_key: $APP_STORE_CONNECT_PRIVATE_KEY
+        key_id: $APP_STORE_CONNECT_KEY_IDENTIFIER
+        issuer_id: $APP_STORE_CONNECT_ISSUER_ID
+        # 上传后自动提交到 TestFlight（App 记录必须已存在，否则这一步失败）
+        submit_to_testflight: true
+
+  # ───────────────────────────────────────────────────────────────
+  # 没有开发者账号时用这个：只产出一个「未签名 ipa」，
+  # 不需要 Apple 账号、不需要 API Key，完全免费。
+  # 下载 artifacts 里的 ipa，再用 Windows 上的 Sideloadly 自签安装。
+  # 详见 docs/no-dev-account.md
+  # ───────────────────────────────────────────────────────────────
+  ios-unsigned:
+    name: FilmSim → 未签名 ipa（自签用，不需要开发者账号）
+    max_build_duration: 45
+
+    environment:
+      vars:
+        XCODE_SCHEME: "FilmSim"
+      xcode: latest
+
+    scripts:
+      - name: 安装 XcodeGen 并生成工程
+        script: |
+          set -e
+          brew install xcodegen
+          xcodegen generate
+
+      - name: 归档（关闭代码签名）
+        script: |
+          set -e
+          xcodebuild -project FilmSim.xcodeproj \
+            -scheme "$XCODE_SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/FilmSim.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            archive
+
+      - name: 打包成 ipa
+        script: |
+          set -e
+          cd build
+          rm -rf Payload FilmSim-unsigned.ipa
+          mkdir -p Payload
+          cp -R FilmSim.xcarchive/Products/Applications/FilmSim.app Payload/
+          ditto -c -k --sequesterRsrc --keepParent Payload FilmSim-unsigned.ipa
+
+    artifacts:
+      - build/FilmSim-unsigned.ipa
